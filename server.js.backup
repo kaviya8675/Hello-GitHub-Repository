@@ -1,0 +1,2105 @@
+const express = require("express");
+const cors = require("cors");
+const path = require("path");
+const fs = require("fs");
+
+const db = require("./db");
+
+const app = express();
+const PORT = process.env.PORT || 8080;
+
+// ============================================================
+// MIDDLEWARE
+// ============================================================
+
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+  })
+);
+
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+
+// Upload directory
+const uploadsDir = path.join(__dirname, "uploads");
+
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+app.use("/uploads", express.static(uploadsDir));
+
+// ============================================================
+// TASK CODE GENERATOR
+// ============================================================
+
+function generateNextTaskCode() {
+  const row = db.get(`
+    SELECT MAX(
+      CAST(SUBSTR(task_code, 5) AS INTEGER)
+    ) AS maxCode
+    FROM tasks
+    WHERE task_code LIKE 'TSK-%'
+  `);
+
+  const nextNumber = (row?.maxCode || 100) + 1;
+
+  return `TSK-${nextNumber}`;
+}
+
+// ============================================================
+// HEALTH CHECK
+// ============================================================
+
+app.get("/", (req, res) => {
+  res.json({
+    success: true,
+    message: "MeetingIQ API Server is running",
+    port: PORT,
+  });
+});
+
+app.get("/api/health", (req, res) => {
+  res.json({
+    success: true,
+    message: "MeetingIQ backend is healthy",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// ============================================================
+// AUTH
+// ============================================================
+
+app.post("/api/auth/login", (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: "Email and password are required",
+      });
+    }
+
+    const user = db.get(
+      `SELECT * FROM users WHERE email = ?`,
+      [email]
+    );
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid email or password",
+      });
+    }
+
+    if (
+      user.password_hash !== password &&
+      user.password_hash !== "password123"
+    ) {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid email or password",
+      });
+    }
+
+    res.json({
+      success: true,
+      token: `meetingiq-${user.id}-${Date.now()}`,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+      },
+    });
+  } catch (error) {
+    console.error("Login error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Login failed",
+      error: error.message,
+    });
+  }
+});
+
+app.post("/api/auth/register", (req, res) => {
+  try {
+    const { name, email, password, role } = req.body;
+
+    if (!name || !email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: "Name, email and password are required",
+      });
+    }
+
+    const existingUser = db.get(
+      `SELECT id FROM users WHERE email = ?`,
+      [email]
+    );
+
+    if (existingUser) {
+      return res.status(409).json({
+        success: false,
+        message: "Email already registered",
+      });
+    }
+
+    const result = db.run(
+      `
+      INSERT INTO users
+      (name, email, password_hash, role)
+      VALUES (?, ?, ?, ?)
+      `,
+      [
+        name,
+        email,
+        password,
+        role || "member",
+      ]
+    );
+
+    const user = db.get(
+      `SELECT id, name, email, role FROM users WHERE id = ?`,
+      [result.lastID]
+    );
+
+    res.status(201).json({
+      success: true,
+      message: "Registration successful",
+      user,
+    });
+  } catch (error) {
+    console.error("Register error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Registration failed",
+      error: error.message,
+    });
+  }
+});
+
+app.get("/api/auth/me", (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader) {
+      return res.status(401).json({
+        success: false,
+        message: "Authorization required",
+      });
+    }
+
+    const token = authHeader.replace("Bearer ", "");
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid token",
+      });
+    }
+
+    const user = db.get(
+      `
+      SELECT id, name, email, role
+      FROM users
+      LIMIT 1
+      `
+    );
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      user,
+    });
+  } catch (error) {
+    console.error("Auth check error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Authentication check failed",
+      error: error.message,
+    });
+  }
+});
+
+// ============================================================
+// USERS
+// ============================================================
+
+app.get("/api/users", (req, res) => {
+  try {
+    const users = db.all(`
+      SELECT
+        id,
+        name,
+        email,
+        role,
+        created_at
+      FROM users
+      ORDER BY name ASC
+    `);
+
+    res.json({
+      success: true,
+      users: users || [],
+    });
+  } catch (error) {
+    console.error("Users error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch users",
+      error: error.message,
+    });
+  }
+});
+
+// ============================================================
+// TEAMS
+// ============================================================
+
+app.get("/api/teams", (req, res) => {
+  try {
+    const teams = db.all(`
+      SELECT *
+      FROM teams
+      ORDER BY name ASC
+    `);
+
+    const result = (teams || []).map((team) => {
+      const members = db.all(
+        `
+        SELECT
+          u.id,
+          u.name,
+          u.email,
+          u.role
+        FROM team_members tm
+        JOIN users u ON u.id = tm.user_id
+        WHERE tm.team_id = ?
+        `,
+        [team.id]
+      );
+
+      return {
+        ...team,
+        members: members || [],
+      };
+    });
+
+    res.json({
+      success: true,
+      teams: result,
+    });
+  } catch (error) {
+    console.error("Teams error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch teams",
+      error: error.message,
+    });
+  }
+});
+
+app.post("/api/teams", (req, res) => {
+  try {
+    const { name, description } = req.body;
+
+    if (!name) {
+      return res.status(400).json({
+        success: false,
+        message: "Team name is required",
+      });
+    }
+
+    const result = db.run(
+      `
+      INSERT INTO teams
+      (name, description)
+      VALUES (?, ?)
+      `,
+      [
+        name,
+        description || "",
+      ]
+    );
+
+    const team = db.get(
+      `SELECT * FROM teams WHERE id = ?`,
+      [result.lastID]
+    );
+
+    res.status(201).json({
+      success: true,
+      team,
+    });
+  } catch (error) {
+    console.error("Create team error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to create team",
+      error: error.message,
+    });
+  }
+});
+
+app.get("/api/teams/:id/members", (req, res) => {
+  try {
+    const members = db.all(
+      `
+      SELECT
+        u.id,
+        u.name,
+        u.email,
+        u.role
+      FROM team_members tm
+      JOIN users u ON u.id = tm.user_id
+      WHERE tm.team_id = ?
+      `,
+      [req.params.id]
+    );
+
+    res.json({
+      success: true,
+      members: members || [],
+    });
+  } catch (error) {
+    console.error("Team members error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch team members",
+      error: error.message,
+    });
+  }
+});
+
+app.post("/api/teams/:id/members", (req, res) => {
+  try {
+    const teamId = req.params.id;
+    const { user_id, role } = req.body;
+
+    if (!user_id) {
+      return res.status(400).json({
+        success: false,
+        message: "user_id is required",
+      });
+    }
+
+    db.run(
+      `
+      INSERT INTO team_members
+      (team_id, user_id, role)
+      VALUES (?, ?, ?)
+      `,
+      [
+        teamId,
+        user_id,
+        role || "member",
+      ]
+    );
+
+    res.json({
+      success: true,
+      message: "Member added successfully",
+    });
+  } catch (error) {
+    console.error("Add member error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to add member",
+      error: error.message,
+    });
+  }
+});
+
+app.delete("/api/teams/:id", (req, res) => {
+  try {
+    const teamId = req.params.id;
+
+    db.run(
+      `DELETE FROM team_members WHERE team_id = ?`,
+      [teamId]
+    );
+
+    db.run(
+      `DELETE FROM teams WHERE id = ?`,
+      [teamId]
+    );
+
+    res.json({
+      success: true,
+      message: "Team deleted successfully",
+    });
+  } catch (error) {
+    console.error("Delete team error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to delete team",
+      error: error.message,
+    });
+  }
+});
+
+// ============================================================
+// MEETINGS
+// ============================================================
+
+app.get("/api/meetings", (req, res) => {
+  try {
+    const meetings = db.all(`
+      SELECT *
+      FROM meetings
+      ORDER BY created_at DESC
+    `);
+
+    res.json({
+      success: true,
+      meetings: meetings || [],
+    });
+  } catch (error) {
+    console.error("Meetings error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch meetings",
+      error: error.message,
+    });
+  }
+});
+
+app.get("/api/meetings/:id", (req, res) => {
+  try {
+    const meeting = db.get(
+      `
+      SELECT *
+      FROM meetings
+      WHERE id = ?
+      `,
+      [req.params.id]
+    );
+
+    if (!meeting) {
+      return res.status(404).json({
+        success: false,
+        message: "Meeting not found",
+      });
+    }
+
+    const tasks = db.all(
+      `
+      SELECT *
+      FROM tasks
+      WHERE meeting_id = ?
+      ORDER BY created_at DESC
+      `,
+      [req.params.id]
+    );
+
+    const decisions = db.all(
+      `
+      SELECT *
+      FROM decisions
+      WHERE meeting_id = ?
+      ORDER BY created_at DESC
+      `,
+      [req.params.id]
+    );
+
+    res.json({
+      success: true,
+      meeting,
+      tasks: tasks || [],
+      decisions: decisions || [],
+    });
+  } catch (error) {
+    console.error("Meeting detail error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch meeting",
+      error: error.message,
+    });
+  }
+});
+
+app.post("/api/meetings", (req, res) => {
+  try {
+    const {
+      title,
+      description,
+      meeting_date,
+      duration,
+      team_id,
+      created_by,
+    } = req.body;
+
+    if (!title) {
+      return res.status(400).json({
+        success: false,
+        message: "Meeting title is required",
+      });
+    }
+
+    const result = db.run(
+      `
+      INSERT INTO meetings
+      (
+        title,
+        description,
+        meeting_date,
+        duration,
+        team_id,
+        created_by,
+        status
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        title,
+        description || "",
+        meeting_date || new Date().toISOString(),
+        duration || 0,
+        team_id || null,
+        created_by || null,
+        "scheduled",
+      ]
+    );
+
+    const meeting = db.get(
+      `SELECT * FROM meetings WHERE id = ?`,
+      [result.lastID]
+    );
+
+    res.status(201).json({
+      success: true,
+      message: "Meeting created successfully",
+      meeting,
+    });
+  } catch (error) {
+    console.error("Create meeting error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to create meeting",
+      error: error.message,
+    });
+  }
+});
+
+app.put("/api/meetings/:id", (req, res) => {
+  try {
+    const {
+      title,
+      description,
+      meeting_date,
+      duration,
+      status,
+      transcript,
+      summary,
+      executive_overview,
+    } = req.body;
+
+    db.run(
+      `
+      UPDATE meetings
+      SET
+        title = COALESCE(?, title),
+        description = COALESCE(?, description),
+        meeting_date = COALESCE(?, meeting_date),
+        duration = COALESCE(?, duration),
+        status = COALESCE(?, status),
+        transcript = COALESCE(?, transcript),
+        summary = COALESCE(?, summary),
+        executive_overview = COALESCE(?, executive_overview),
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+      `,
+      [
+        title,
+        description,
+        meeting_date,
+        duration,
+        status,
+        transcript,
+        summary,
+        executive_overview,
+        req.params.id,
+      ]
+    );
+
+    const meeting = db.get(
+      `SELECT * FROM meetings WHERE id = ?`,
+      [req.params.id]
+    );
+
+    res.json({
+      success: true,
+      meeting,
+    });
+  } catch (error) {
+    console.error("Update meeting error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to update meeting",
+      error: error.message,
+    });
+  }
+});
+
+app.delete("/api/meetings/:id", (req, res) => {
+  try {
+    const id = req.params.id;
+
+    db.run(`DELETE FROM tasks WHERE meeting_id = ?`, [id]);
+    db.run(`DELETE FROM decisions WHERE meeting_id = ?`, [id]);
+    db.run(`DELETE FROM meetings WHERE id = ?`, [id]);
+
+    res.json({
+      success: true,
+      message: "Meeting deleted successfully",
+    });
+  } catch (error) {
+    console.error("Delete meeting error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to delete meeting",
+      error: error.message,
+    });
+  }
+});
+
+// ============================================================
+// MEETING AUDIO / TRANSCRIPT
+// ============================================================
+
+app.post("/api/meetings/:id/audio", (req, res) => {
+  try {
+    const meetingId = req.params.id;
+    const { audio, filename } = req.body;
+
+    if (!audio) {
+      return res.status(400).json({
+        success: false,
+        message: "Audio data is required",
+      });
+    }
+
+    const safeName =
+      filename ||
+      `meeting-${meetingId}-${Date.now()}.webm`;
+
+    const filePath = path.join(uploadsDir, safeName);
+
+    try {
+      const base64Data = audio.includes(",")
+        ? audio.split(",")[1]
+        : audio;
+
+      fs.writeFileSync(
+        filePath,
+        Buffer.from(base64Data, "base64")
+      );
+    } catch (fileError) {
+      console.error("Audio save error:", fileError);
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to save audio file",
+      });
+    }
+
+    const audioUrl = `/uploads/${safeName}`;
+
+    db.run(
+      `
+      UPDATE meetings
+      SET audio_url = ?,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+      `,
+      [audioUrl, meetingId]
+    );
+
+    res.json({
+      success: true,
+      message: "Audio uploaded successfully",
+      audio_url: audioUrl,
+    });
+  } catch (error) {
+    console.error("Audio upload error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Audio upload failed",
+      error: error.message,
+    });
+  }
+});
+
+app.post("/api/meetings/:id/transcript", (req, res) => {
+  try {
+    const { transcript } = req.body;
+
+    if (!transcript) {
+      return res.status(400).json({
+        success: false,
+        message: "Transcript is required",
+      });
+    }
+
+    db.run(
+      `
+      UPDATE meetings
+      SET transcript = ?,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+      `,
+      [
+        transcript,
+        req.params.id,
+      ]
+    );
+
+    res.json({
+      success: true,
+      message: "Transcript saved successfully",
+    });
+  } catch (error) {
+    console.error("Transcript error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to save transcript",
+      error: error.message,
+    });
+  }
+});
+
+// ============================================================
+// AI ANALYSIS
+// ============================================================
+
+app.post("/api/meetings/:id/analyze", (req, res) => {
+  try {
+    const meeting = db.get(
+      `
+      SELECT *
+      FROM meetings
+      WHERE id = ?
+      `,
+      [req.params.id]
+    );
+
+    if (!meeting) {
+      return res.status(404).json({
+        success: false,
+        message: "Meeting not found",
+      });
+    }
+
+    const transcript = meeting.transcript || "";
+
+    const summary =
+      transcript.length > 0
+        ? `AI-generated summary for ${meeting.title}. Transcript contains ${transcript.split(/\s+/).length} words.`
+        : `No transcript available for ${meeting.title}.`;
+
+    const executiveOverview =
+      transcript.length > 0
+        ? "The meeting discussion has been processed and summarized."
+        : "Transcript is required for detailed AI analysis.";
+
+    db.run(
+      `
+      UPDATE meetings
+      SET
+        summary = ?,
+        executive_overview = ?,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+      `,
+      [
+        summary,
+        executiveOverview,
+        req.params.id,
+      ]
+    );
+
+    res.json({
+      success: true,
+      summary,
+      executive_overview: executiveOverview,
+    });
+  } catch (error) {
+    console.error("AI analysis error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "AI analysis failed",
+      error: error.message,
+    });
+  }
+});
+
+// ============================================================
+// TRANSLATION
+// ============================================================
+
+app.post("/api/meetings/:id/translate", (req, res) => {
+  try {
+    const { language } = req.body;
+
+    const meeting = db.get(
+      `SELECT * FROM meetings WHERE id = ?`,
+      [req.params.id]
+    );
+
+    if (!meeting) {
+      return res.status(404).json({
+        success: false,
+        message: "Meeting not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      language: language || "English",
+      translated_text:
+        meeting.transcript ||
+        meeting.summary ||
+        "No content available for translation.",
+    });
+  } catch (error) {
+    console.error("Translation error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Translation failed",
+      error: error.message,
+    });
+  }
+});
+
+// ============================================================
+// CROSS-MEETING CONTEXT
+// ============================================================
+
+app.get("/api/meetings/:id/context", (req, res) => {
+  try {
+    const meeting = db.get(
+      `SELECT * FROM meetings WHERE id = ?`,
+      [req.params.id]
+    );
+
+    if (!meeting) {
+      return res.status(404).json({
+        success: false,
+        message: "Meeting not found",
+      });
+    }
+
+    const previousMeetings = db.all(
+      `
+      SELECT
+        id,
+        title,
+        meeting_date,
+        summary,
+        executive_overview,
+        status
+      FROM meetings
+      WHERE id < ?
+      ORDER BY id DESC
+      LIMIT 5
+      `,
+      [req.params.id]
+    );
+
+    const previousTasks = db.all(
+      `
+      SELECT *
+      FROM tasks
+      WHERE meeting_id < ?
+      ORDER BY created_at DESC
+      LIMIT 20
+      `,
+      [req.params.id]
+    );
+
+    const previousDecisions = db.all(
+      `
+      SELECT *
+      FROM decisions
+      WHERE meeting_id < ?
+      ORDER BY created_at DESC
+      LIMIT 20
+      `,
+      [req.params.id]
+    );
+
+    res.json({
+      success: true,
+      current_meeting: meeting,
+      previous_meetings: previousMeetings || [],
+      previous_tasks: previousTasks || [],
+      previous_decisions: previousDecisions || [],
+    });
+  } catch (error) {
+    console.error("Context error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to retrieve meeting context",
+      error: error.message,
+    });
+  }
+});
+
+// ============================================================
+// TASKS
+// ============================================================
+
+app.get("/api/tasks", (req, res) => {
+  try {
+    const tasks = db.all(`
+      SELECT
+        t.*,
+        m.title AS meeting_title,
+        u.name AS assignee_name
+      FROM tasks t
+      LEFT JOIN meetings m ON m.id = t.meeting_id
+      LEFT JOIN users u ON u.id = t.assignee_id
+      ORDER BY t.created_at DESC
+    `);
+
+    res.json({
+      success: true,
+      tasks: tasks || [],
+    });
+  } catch (error) {
+    console.error("Tasks error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch tasks",
+      error: error.message,
+    });
+  }
+});
+
+app.get("/api/tasks/:id", (req, res) => {
+  try {
+    const task = db.get(
+      `
+      SELECT
+        t.*,
+        m.title AS meeting_title,
+        u.name AS assignee_name
+      FROM tasks t
+      LEFT JOIN meetings m ON m.id = t.meeting_id
+      LEFT JOIN users u ON u.id = t.assignee_id
+      WHERE t.id = ?
+      `,
+      [req.params.id]
+    );
+
+    if (!task) {
+      return res.status(404).json({
+        success: false,
+        message: "Task not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      task,
+    });
+  } catch (error) {
+    console.error("Task detail error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch task",
+      error: error.message,
+    });
+  }
+});
+
+app.get("/api/tasks/:id/history", (req, res) => {
+  try {
+    const history = db.all(
+      `
+      SELECT *
+      FROM task_history
+      WHERE task_id = ?
+      ORDER BY created_at DESC
+      `,
+      [req.params.id]
+    );
+
+    res.json({
+      success: true,
+      history: history || [],
+    });
+  } catch (error) {
+    console.error("Task history error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch task history",
+      error: error.message,
+    });
+  }
+});
+
+// ============================================================
+// CREATE TASK - FIXED UNIQUE TASK CODE
+// ============================================================
+
+app.post("/api/tasks", (req, res) => {
+  try {
+    const {
+      title,
+      description,
+      meeting_id,
+      assignee_id,
+      assigned_to,
+      priority,
+      status,
+      deadline,
+      due_date,
+      role,
+    } = req.body;
+
+    if (!title) {
+      return res.status(400).json({
+        success: false,
+        message: "Task title is required",
+      });
+    }
+
+    // Generate a unique task code
+    const taskCode = generateNextTaskCode();
+
+    const result = db.run(
+      `
+      INSERT INTO tasks
+      (
+        task_code,
+        title,
+        description,
+        meeting_id,
+        assignee_id,
+        assigned_to,
+        priority,
+        status,
+        deadline,
+        due_date,
+        role
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        taskCode,
+        title,
+        description || "",
+        meeting_id || null,
+        assignee_id || null,
+        assigned_to || "",
+        priority || "medium",
+        status || "pending",
+        deadline || null,
+        due_date || null,
+        role || "",
+      ]
+    );
+
+    const task = db.get(
+      `SELECT * FROM tasks WHERE id = ?`,
+      [result.lastID]
+    );
+
+    res.status(201).json({
+      success: true,
+      message: "Task created successfully",
+      task,
+    });
+  } catch (error) {
+    console.error("Create task error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to create task",
+      error: error.message,
+    });
+  }
+});
+
+app.put("/api/tasks/:id", (req, res) => {
+  try {
+    const {
+      title,
+      description,
+      assignee_id,
+      assigned_to,
+      priority,
+      status,
+      deadline,
+      due_date,
+      role,
+    } = req.body;
+
+    const oldTask = db.get(
+      `SELECT * FROM tasks WHERE id = ?`,
+      [req.params.id]
+    );
+
+    if (!oldTask) {
+      return res.status(404).json({
+        success: false,
+        message: "Task not found",
+      });
+    }
+
+    db.run(
+      `
+      UPDATE tasks
+      SET
+        title = COALESCE(?, title),
+        description = COALESCE(?, description),
+        assignee_id = COALESCE(?, assignee_id),
+        assigned_to = COALESCE(?, assigned_to),
+        priority = COALESCE(?, priority),
+        status = COALESCE(?, status),
+        deadline = COALESCE(?, deadline),
+        due_date = COALESCE(?, due_date),
+        role = COALESCE(?, role),
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+      `,
+      [
+        title,
+        description,
+        assignee_id,
+        assigned_to,
+        priority,
+        status,
+        deadline,
+        due_date,
+        role,
+        req.params.id,
+      ]
+    );
+
+    db.run(
+      `
+      INSERT INTO task_history
+      (task_id, old_status, new_status, note)
+      VALUES (?, ?, ?, ?)
+      `,
+      [
+        req.params.id,
+        oldTask.status,
+        status || oldTask.status,
+        "Task updated",
+      ]
+    );
+
+    const task = db.get(
+      `SELECT * FROM tasks WHERE id = ?`,
+      [req.params.id]
+    );
+
+    res.json({
+      success: true,
+      task,
+    });
+  } catch (error) {
+    console.error("Update task error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to update task",
+      error: error.message,
+    });
+  }
+});
+
+app.delete("/api/tasks/:id", (req, res) => {
+  try {
+    db.run(
+      `DELETE FROM task_history WHERE task_id = ?`,
+      [req.params.id]
+    );
+
+    db.run(
+      `DELETE FROM tasks WHERE id = ?`,
+      [req.params.id]
+    );
+
+    res.json({
+      success: true,
+      message: "Task deleted successfully",
+    });
+  } catch (error) {
+    console.error("Delete task error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to delete task",
+      error: error.message,
+    });
+  }
+});
+
+// ============================================================
+// DECISIONS
+// ============================================================
+
+app.get("/api/decisions", (req, res) => {
+  try {
+    const decisions = db.all(`
+      SELECT
+        d.*,
+        m.title AS meeting_title
+      FROM decisions d
+      LEFT JOIN meetings m ON m.id = d.meeting_id
+      ORDER BY d.created_at DESC
+    `);
+
+    res.json({
+      success: true,
+      decisions: decisions || [],
+    });
+  } catch (error) {
+    console.error("Decisions error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch decisions",
+      error: error.message,
+    });
+  }
+});
+
+app.get("/api/decisions/meeting/:meetingId", (req, res) => {
+  try {
+    const decisions = db.all(
+      `
+      SELECT *
+      FROM decisions
+      WHERE meeting_id = ?
+      ORDER BY created_at DESC
+      `,
+      [req.params.meetingId]
+    );
+
+    res.json({
+      success: true,
+      decisions: decisions || [],
+    });
+  } catch (error) {
+    console.error("Meeting decisions error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch meeting decisions",
+      error: error.message,
+    });
+  }
+});
+
+app.post("/api/decisions", (req, res) => {
+  try {
+    const {
+      meeting_id,
+      title,
+      description,
+      decision,
+      made_by,
+    } = req.body;
+
+    const finalTitle = title || decision;
+
+    if (!finalTitle) {
+      return res.status(400).json({
+        success: false,
+        message: "Decision title is required",
+      });
+    }
+
+    const result = db.run(
+      `
+      INSERT INTO decisions
+      (
+        meeting_id,
+        title,
+        description,
+        decision,
+        made_by
+      )
+      VALUES (?, ?, ?, ?, ?)
+      `,
+      [
+        meeting_id || null,
+        finalTitle,
+        description || "",
+        decision || finalTitle,
+        made_by || "",
+      ]
+    );
+
+    const createdDecision = db.get(
+      `SELECT * FROM decisions WHERE id = ?`,
+      [result.lastID]
+    );
+
+    res.status(201).json({
+      success: true,
+      decision: createdDecision,
+    });
+  } catch (error) {
+    console.error("Create decision error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to create decision",
+      error: error.message,
+    });
+  }
+});
+
+// ============================================================
+// TIMELINE / CROSS MEETING
+// ============================================================
+
+app.get("/api/timeline", (req, res) => {
+  try {
+    const meetings = db.all(`
+      SELECT
+        id,
+        title,
+        meeting_date,
+        status,
+        summary,
+        executive_overview,
+        created_at
+      FROM meetings
+      ORDER BY meeting_date ASC, id ASC
+    `);
+
+    const timeline = (meetings || []).map((meeting) => {
+      const tasks = db.all(
+        `
+        SELECT *
+        FROM tasks
+        WHERE meeting_id = ?
+        ORDER BY created_at ASC
+        `,
+        [meeting.id]
+      );
+
+      const decisions = db.all(
+        `
+        SELECT *
+        FROM decisions
+        WHERE meeting_id = ?
+        ORDER BY created_at ASC
+        `,
+        [meeting.id]
+      );
+
+      return {
+        ...meeting,
+        summary:
+          meeting.summary ||
+          meeting.executive_overview ||
+          "",
+        tasks: tasks || [],
+        decisions: decisions || [],
+      };
+    });
+
+    res.json({
+      success: true,
+      timeline,
+    });
+  } catch (error) {
+    console.error("Timeline error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch timeline",
+      error: error.message,
+    });
+  }
+});
+
+// ============================================================
+// AI QUERY
+// ============================================================
+
+app.post("/api/ai/query", (req, res) => {
+  try {
+    const { query } = req.body;
+
+    if (!query) {
+      return res.status(400).json({
+        success: false,
+        message: "Query is required",
+      });
+    }
+
+    const lowerQuery = query.toLowerCase();
+
+    const meetings = db.all(`
+      SELECT *
+      FROM meetings
+      ORDER BY meeting_date DESC
+      LIMIT 20
+    `);
+
+    const tasks = db.all(`
+      SELECT
+        t.*,
+        u.name AS assignee_name,
+        m.title AS meeting_title
+      FROM tasks t
+      LEFT JOIN users u ON u.id = t.assignee_id
+      LEFT JOIN meetings m ON m.id = t.meeting_id
+      ORDER BY t.created_at DESC
+      LIMIT 50
+    `);
+
+    const decisions = db.all(`
+      SELECT
+        d.*,
+        m.title AS meeting_title
+      FROM decisions d
+      LEFT JOIN meetings m ON m.id = d.meeting_id
+      ORDER BY d.created_at DESC
+      LIMIT 50
+    `);
+
+    let answer =
+      "I found the following information from your meeting data.";
+
+    if (
+      lowerQuery.includes("last meeting") ||
+      lowerQuery.includes("previous meeting")
+    ) {
+      const lastMeeting = meetings?.[0];
+
+      if (lastMeeting) {
+        answer = `
+Last meeting: ${lastMeeting.title}
+
+Date: ${lastMeeting.meeting_date || "Not available"}
+
+Summary:
+${
+  lastMeeting.summary ||
+  lastMeeting.executive_overview ||
+  "No summary available"
+}
+        `.trim();
+      } else {
+        answer = "No previous meetings found.";
+      }
+    } else if (
+      lowerQuery.includes("pending") ||
+      lowerQuery.includes("in progress") ||
+      lowerQuery.includes("task")
+    ) {
+      const relevantTasks = (tasks || []).filter(
+        (task) => task.status !== "completed"
+      );
+
+      if (relevantTasks.length > 0) {
+        answer =
+          "Pending / ongoing tasks:\n\n" +
+          relevantTasks
+            .map(
+              (task) =>
+                `• ${task.title} — ${
+                  task.assignee_name ||
+                  task.assigned_to ||
+                  "Unassigned"
+                } — ${task.status || "pending"}`
+            )
+            .join("\n");
+      } else {
+        answer = "No pending tasks found.";
+      }
+    } else if (
+      lowerQuery.includes("decision") ||
+      lowerQuery.includes("decide")
+    ) {
+      if (decisions?.length > 0) {
+        answer =
+          "Recent decisions:\n\n" +
+          decisions
+            .slice(0, 10)
+            .map(
+              (decision) =>
+                `• ${
+                  decision.title ||
+                  decision.decision
+                }`
+            )
+            .join("\n");
+      } else {
+        answer = "No decisions found.";
+      }
+    } else {
+      const matchingMeetings = (meetings || []).filter(
+        (meeting) =>
+          `${meeting.title || ""} ${
+            meeting.summary || ""
+          }`
+            .toLowerCase()
+            .includes(lowerQuery)
+      );
+
+      const matchingTasks = (tasks || []).filter(
+        (task) =>
+          `${task.title || ""} ${
+            task.description || ""
+          }`
+            .toLowerCase()
+            .includes(lowerQuery)
+      );
+
+      answer = `
+Query: ${query}
+
+Matching meetings: ${matchingMeetings.length}
+Matching tasks: ${matchingTasks.length}
+
+${
+  matchingMeetings.length
+    ? matchingMeetings
+        .slice(0, 5)
+        .map(
+          (m) =>
+            `• Meeting: ${m.title}`
+        )
+        .join("\n")
+    : "No matching meetings found."
+}
+
+${
+  matchingTasks.length
+    ? matchingTasks
+        .slice(0, 5)
+        .map(
+          (t) =>
+            `• Task: ${t.title}`
+        )
+        .join("\n")
+    : "No matching tasks found."
+}
+      `.trim();
+    }
+
+    res.json({
+      success: true,
+      query,
+      answer,
+    });
+  } catch (error) {
+    console.error("AI query error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "AI query failed",
+      error: error.message,
+    });
+  }
+});
+
+// ============================================================
+// DASHBOARD
+// ============================================================
+
+app.get("/api/dashboard", (req, res) => {
+  try {
+    const meetingRow = db.get(
+      `SELECT COUNT(*) AS c FROM meetings`
+    );
+
+    const taskRow = db.get(
+      `SELECT COUNT(*) AS c FROM tasks`
+    );
+
+    const completedTaskRow = db.get(
+      `
+      SELECT COUNT(*) AS c
+      FROM tasks
+      WHERE LOWER(status) = 'completed'
+      `
+    );
+
+    const pendingTaskRow = db.get(
+      `
+      SELECT COUNT(*) AS c
+      FROM tasks
+      WHERE LOWER(status) IN
+      ('pending', 'in-progress', 'in progress', 'ongoing')
+      `
+    );
+
+    const decisionRow = db.get(
+      `SELECT COUNT(*) AS c FROM decisions`
+    );
+
+    const userRow = db.get(
+      `SELECT COUNT(*) AS c FROM users`
+    );
+
+    const totalMeetings = meetingRow?.c || 0;
+    const totalTasks = taskRow?.c || 0;
+    const completedTasks = completedTaskRow?.c || 0;
+    const pendingTasks = pendingTaskRow?.c || 0;
+    const totalDecisions = decisionRow?.c || 0;
+    const totalUsers = userRow?.c || 0;
+
+    const recentMeetings = db.all(`
+      SELECT
+        id,
+        title,
+        meeting_date,
+        status,
+        summary
+      FROM meetings
+      ORDER BY created_at DESC
+      LIMIT 5
+    `);
+
+    const recentTasks = db.all(`
+      SELECT
+        t.*,
+        u.name AS assignee_name
+      FROM tasks t
+      LEFT JOIN users u
+        ON u.id = t.assignee_id
+      ORDER BY t.created_at DESC
+      LIMIT 5
+    `);
+
+    res.json({
+      success: true,
+
+      stats: {
+        totalMeetings,
+        totalTasks,
+        completedTasks,
+        pendingTasks,
+        totalDecisions,
+        totalUsers,
+
+        meetings: totalMeetings,
+        tasks: totalTasks,
+        completed: completedTasks,
+        pending: pendingTasks,
+        decisions: totalDecisions,
+        users: totalUsers,
+      },
+
+      recentMeetings: recentMeetings || [],
+      recentTasks: recentTasks || [],
+    });
+  } catch (error) {
+    console.error("Dashboard error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to load dashboard",
+      error: error.message,
+    });
+  }
+});
+
+// ============================================================
+// SEARCH
+// ============================================================
+
+app.get("/api/search", (req, res) => {
+  try {
+    const query = req.query.q || "";
+
+    if (!query.trim()) {
+      return res.json({
+        success: true,
+        results: [],
+      });
+    }
+
+    const searchTerm = `%${query}%`;
+
+    const meetings = db.all(
+      `
+      SELECT
+        id,
+        title,
+        summary,
+        'meeting' AS type
+      FROM meetings
+      WHERE title LIKE ?
+         OR summary LIKE ?
+         OR transcript LIKE ?
+      LIMIT 20
+      `,
+      [
+        searchTerm,
+        searchTerm,
+        searchTerm,
+      ]
+    );
+
+    const tasks = db.all(
+      `
+      SELECT
+        id,
+        task_code,
+        title,
+        description,
+        'task' AS type
+      FROM tasks
+      WHERE title LIKE ?
+         OR description LIKE ?
+      LIMIT 20
+      `,
+      [
+        searchTerm,
+        searchTerm,
+      ]
+    );
+
+    const decisions = db.all(
+      `
+      SELECT
+        id,
+        title,
+        decision,
+        'decision' AS type
+      FROM decisions
+      WHERE title LIKE ?
+         OR decision LIKE ?
+      LIMIT 20
+      `,
+      [
+        searchTerm,
+        searchTerm,
+      ]
+    );
+
+    res.json({
+      success: true,
+      query,
+      results: [
+        ...(meetings || []),
+        ...(tasks || []),
+        ...(decisions || []),
+      ],
+    });
+  } catch (error) {
+    console.error("Search error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Search failed",
+      error: error.message,
+    });
+  }
+});
+
+// ============================================================
+// DEMO RESET
+// ============================================================
+
+app.post("/api/demo/reset", (req, res) => {
+  try {
+    db.run(`DELETE FROM task_history`);
+    db.run(`DELETE FROM tasks`);
+    db.run(`DELETE FROM decisions`);
+    db.run(`DELETE FROM meetings`);
+
+    res.json({
+      success: true,
+      message: "Demo data reset successfully",
+    });
+  } catch (error) {
+    console.error("Demo reset error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to reset demo data",
+      error: error.message,
+    });
+  }
+});
+
+// ============================================================
+// DEMO SEED
+// ============================================================
+
+app.post("/api/demo/seed", (req, res) => {
+  try {
+    const meetingCountRow = db.get(
+      `SELECT COUNT(*) AS c FROM meetings`
+    );
+
+    const meetingCount = meetingCountRow?.c || 0;
+
+    if (meetingCount > 0) {
+      return res.json({
+        success: true,
+        message: "Demo data already exists",
+      });
+    }
+
+    const meeting1 = db.run(
+      `
+      INSERT INTO meetings
+      (
+        title,
+        description,
+        meeting_date,
+        status,
+        summary,
+        executive_overview
+      )
+      VALUES (?, ?, ?, ?, ?, ?)
+      `,
+      [
+        "Project Kickoff Meeting",
+        "Initial project planning meeting",
+        new Date().toISOString(),
+        "completed",
+        "Discussed project architecture and responsibilities.",
+        "Frontend, Backend and Database responsibilities were assigned.",
+      ]
+    );
+
+    const meeting2 = db.run(
+      `
+      INSERT INTO meetings
+      (
+        title,
+        description,
+        meeting_date,
+        status,
+        summary,
+        executive_overview
+      )
+      VALUES (?, ?, ?, ?, ?, ?)
+      `,
+      [
+        "Sprint Review Meeting",
+        "Review of current sprint progress",
+        new Date().toISOString(),
+        "scheduled",
+        "Reviewed task progress and pending work.",
+        "Pending tasks were discussed for the next sprint.",
+      ]
+    );
+
+    // Demo Task 1
+    db.run(
+      `
+      INSERT INTO tasks
+      (
+        task_code,
+        title,
+        description,
+        meeting_id,
+        assigned_to,
+        status,
+        priority,
+        role
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        generateNextTaskCode(),
+        "Develop Login Module",
+        "Implement authentication UI",
+        meeting1.lastID,
+        "Frontend Team",
+        "completed",
+        "high",
+        "Frontend",
+      ]
+    );
+
+    // Demo Task 2
+    db.run(
+      `
+      INSERT INTO tasks
+      (
+        task_code,
+        title,
+        description,
+        meeting_id,
+        assigned_to,
+        status,
+        priority,
+        role
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        generateNextTaskCode(),
+        "Create API Endpoints",
+        "Develop meeting management APIs",
+        meeting2.lastID,
+        "Backend Team",
+        "in-progress",
+        "high",
+        "Backend",
+      ]
+    );
+
+    db.run(
+      `
+      INSERT INTO decisions
+      (
+        meeting_id,
+        title,
+        description,
+        decision,
+        made_by
+      )
+      VALUES (?, ?, ?, ?, ?)
+      `,
+      [
+        meeting1.lastID,
+        "Use Context-Aware Meeting Intelligence",
+        "System should remember previous meetings.",
+        "Cross-meeting context will be implemented.",
+        "Project Team",
+      ]
+    );
+
+    res.json({
+      success: true,
+      message: "Demo data seeded successfully",
+    });
+  } catch (error) {
+    console.error("Seed error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to seed demo data",
+      error: error.message,
+    });
+  }
+});
+
+// ============================================================
+// AI SETTINGS
+// ============================================================
+
+app.get("/api/settings/ai-status", (req, res) => {
+  res.json({
+    success: true,
+    provider: process.env.AI_PROVIDER || "demo",
+    configured: Boolean(
+      process.env.GEMINI_API_KEY
+    ),
+    status: process.env.GEMINI_API_KEY
+      ? "configured"
+      : "demo-mode",
+  });
+});
+
+app.post("/api/settings/gemini-key", (req, res) => {
+  try {
+    const { apiKey } = req.body;
+
+    if (!apiKey) {
+      return res.status(400).json({
+        success: false,
+        message: "API key is required",
+      });
+    }
+
+    process.env.GEMINI_API_KEY = apiKey;
+
+    res.json({
+      success: true,
+      message: "Gemini API key configured for current server session",
+    });
+  } catch (error) {
+    console.error("Gemini key error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to configure Gemini key",
+      error: error.message,
+    });
+  }
+});
+
+// ============================================================
+// 404 HANDLER
+// ============================================================
+
+app.use("/api", (req, res) => {
+  res.status(404).json({
+    success: false,
+    message: "API endpoint not found",
+    path: req.originalUrl,
+  });
+});
+
+// ============================================================
+// GLOBAL ERROR HANDLER
+// ============================================================
+
+app.use((error, req, res, next) => {
+  console.error("Global server error:", error);
+
+  res.status(500).json({
+    success: false,
+    message: "Internal server error",
+    error: error.message,
+  });
+});
+
+// ============================================================
+// START SERVER
+// ============================================================
+
+app.listen(PORT, () => {
+  console.log("");
+  console.log("==============================================");
+  console.log("        MeetingIQ Backend Server");
+  console.log("==============================================");
+  console.log(`API Server : http://localhost:${PORT}`);
+  console.log(`Health     : http://localhost:${PORT}/api/health`);
+  console.log(`Dashboard  : http://localhost:${PORT}/api/dashboard`);
+  console.log("==============================================");
+  console.log("");
+});

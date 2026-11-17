@@ -1,0 +1,648 @@
+const fs = require('fs');
+const path = require('path');
+const initSqlJs = require('sql.js');
+
+const DB_DIR = path.join(__dirname, 'database');
+const DB_FILE = path.join(DB_DIR, 'meeting_intelligence.db');
+
+if (!fs.existsSync(DB_DIR)) {
+  fs.mkdirSync(DB_DIR, { recursive: true });
+}
+
+let dbInstance = null;
+let SQL = null;
+let initPromise = null;
+
+// Helper: Save database instance to disk binary file
+function persist() {
+  if (dbInstance) {
+    const data = dbInstance.export();
+    const buffer = Buffer.from(data);
+    fs.writeFileSync(DB_FILE, buffer);
+  }
+}
+
+// Helper: safe column addition for backwards compatibility
+function addColumnIfNotExists(table, column, definition) {
+  if (!dbInstance) return;
+  try {
+    const stmt = dbInstance.prepare(`PRAGMA table_info(${table})`);
+    const cols = [];
+    while (stmt.step()) {
+      cols.push(stmt.getAsObject());
+    }
+    stmt.free();
+    const exists = cols.some(c => (c.name || '').toLowerCase() === column.toLowerCase());
+    if (!exists) {
+      dbInstance.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`);
+    }
+  } catch (e) {
+    // column addition error ignored
+  }
+}
+
+// Initialize database
+async function getDb() {
+  if (dbInstance) return dbInstance;
+  if (initPromise) return initPromise;
+
+  initPromise = (async () => {
+    if (!SQL) {
+      SQL = await initSqlJs();
+    }
+
+    if (fs.existsSync(DB_FILE)) {
+      try {
+        const filebuffer = fs.readFileSync(DB_FILE);
+        dbInstance = new SQL.Database(filebuffer);
+      } catch (e) {
+        console.warn('Failed to load existing DB file, creating a fresh one:', e.message);
+        dbInstance = new SQL.Database();
+      }
+    } else {
+      dbInstance = new SQL.Database();
+    }
+
+    // Enable foreign keys
+    dbInstance.run('PRAGMA foreign_keys = ON;');
+
+    createSchema();
+    runMigrations();
+    seedInitialRolesAndUsers();
+    persist();
+
+    return dbInstance;
+  })();
+
+  return initPromise;
+}
+
+function createSchema() {
+  dbInstance.run(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      full_name TEXT NOT NULL,
+      role TEXT DEFAULT 'USER',
+      avatar_url TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS teams (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT UNIQUE NOT NULL,
+      description TEXT,
+      color TEXT DEFAULT 'indigo',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS team_members (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      team_id INTEGER NOT NULL,
+      user_name TEXT NOT NULL,
+      role_title TEXT,
+      email TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS meetings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL,
+      meeting_date TEXT NOT NULL,
+      start_time TEXT NOT NULL,
+      duration_minutes INTEGER DEFAULT 30,
+      agenda TEXT,
+      location_or_link TEXT,
+      status TEXT DEFAULT 'COMPLETED',
+      audio_file_url TEXT,
+      audio_filename TEXT,
+      created_by_user_id INTEGER,
+      summary TEXT,
+      executive_overview TEXT,
+      follow_up_notes TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (created_by_user_id) REFERENCES users(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS participants (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      meeting_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      email TEXT,
+      role_in_meeting TEXT DEFAULT 'Attendee',
+      department TEXT,
+      team_id INTEGER,
+      attended INTEGER DEFAULT 1,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS transcripts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      meeting_id INTEGER NOT NULL UNIQUE,
+      raw_text TEXT NOT NULL,
+      diarized_json TEXT,
+      confidence_score REAL DEFAULT 0.95,
+      language TEXT DEFAULT 'en-US',
+      audio_duration_seconds INTEGER DEFAULT 0,
+      processed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS summaries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      meeting_id INTEGER NOT NULL UNIQUE,
+      overview TEXT,
+      key_points_json TEXT,
+      follow_up_json TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS decisions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      meeting_id INTEGER NOT NULL,
+      decision_text TEXT NOT NULL,
+      topic TEXT,
+      people_involved TEXT,
+      rationale TEXT,
+      impact_level TEXT DEFAULT 'MEDIUM',
+      status TEXT DEFAULT 'ACTIVE',
+      decided_date TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_code TEXT UNIQUE,
+      title TEXT NOT NULL,
+      description TEXT,
+      assigned_person TEXT NOT NULL,
+      assigned_team TEXT,
+      priority TEXT DEFAULT 'MEDIUM',
+      status TEXT DEFAULT 'PENDING',
+      created_date TEXT NOT NULL,
+      original_deadline TEXT NOT NULL,
+      current_deadline TEXT NOT NULL,
+      completion_date TEXT,
+      source_meeting_id INTEGER NOT NULL,
+      last_discussed_meeting_id INTEGER,
+      progress_percentage INTEGER DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (source_meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS task_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id INTEGER NOT NULL,
+      meeting_id INTEGER,
+      action_type TEXT NOT NULL,
+      previous_status TEXT,
+      new_status TEXT,
+      previous_deadline TEXT,
+      new_deadline TEXT,
+      previous_assignee TEXT,
+      new_assignee TEXT,
+      progress_note TEXT,
+      discussed_date TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS action_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      meeting_id INTEGER NOT NULL,
+      item_description TEXT NOT NULL,
+      assigned_to TEXT,
+      due_date TEXT,
+      is_completed INTEGER DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS unresolved_issues (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      meeting_id INTEGER NOT NULL,
+      issue_description TEXT NOT NULL,
+      raised_by TEXT,
+      status TEXT DEFAULT 'OPEN',
+      resolved_in_meeting_id INTEGER,
+      resolution_notes TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS meeting_relationships (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      current_meeting_id INTEGER NOT NULL,
+      previous_meeting_id INTEGER NOT NULL,
+      continuity_summary TEXT,
+      carried_forward_tasks_count INTEGER DEFAULT 0,
+      resolved_issues_count INTEGER DEFAULT 0,
+      context_similarity_score REAL DEFAULT 0.0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (current_meeting_id) REFERENCES meetings(id) ON DELETE CASCADE,
+      FOREIGN KEY (previous_meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS translations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      meeting_id INTEGER NOT NULL,
+      target_language TEXT NOT NULL,
+      transcript_translated TEXT,
+      summary_translated TEXT,
+      key_points_translated TEXT,
+      decisions_translated TEXT,
+      tasks_translated TEXT,
+      translated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS ai_query_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_query TEXT NOT NULL,
+      ai_response TEXT NOT NULL,
+      context_used_json TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+}
+
+function runMigrations() {
+  addColumnIfNotExists('users', 'name', 'TEXT');
+  addColumnIfNotExists('teams', 'color', 'TEXT DEFAULT "indigo"');
+  addColumnIfNotExists('team_members', 'user_id', 'INTEGER');
+  addColumnIfNotExists('meetings', 'description', 'TEXT');
+  addColumnIfNotExists('meetings', 'duration', 'INTEGER DEFAULT 30');
+  addColumnIfNotExists('meetings', 'created_by', 'INTEGER');
+  addColumnIfNotExists('tasks', 'meeting_id', 'INTEGER');
+  addColumnIfNotExists('tasks', 'assignee_id', 'INTEGER');
+  addColumnIfNotExists('tasks', 'assigned_to', 'TEXT');
+  addColumnIfNotExists('tasks', 'deadline', 'TEXT');
+  addColumnIfNotExists('tasks', 'due_date', 'TEXT');
+  addColumnIfNotExists('tasks', 'role', 'TEXT');
+}
+
+function seedInitialRolesAndUsers() {
+  const usersCount = querySync('SELECT COUNT(*) as count FROM users')[0]?.count || 0;
+  if (usersCount === 0) {
+    runSync(`
+      INSERT INTO users (username, email, password_hash, full_name, role, avatar_url)
+      VALUES 
+      ('admin', 'admin@meetingiq.ai', 'password123', 'Dr. Sarah Jenkins', 'ADMIN', 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=150'),
+      ('rahul_dev', 'rahul@meetingiq.ai', 'password123', 'Rahul Sharma', 'DEVELOPER', 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150'),
+      ('priya_dba', 'priya@meetingiq.ai', 'password123', 'Priya Patel', 'DATA_ENGINEER', 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150'),
+      ('arun_lead', 'arun@meetingiq.ai', 'password123', 'Arun Kumar', 'TECH_LEAD', 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=150');
+    `);
+  }
+
+  const teamsCount = querySync('SELECT COUNT(*) as count FROM teams')[0]?.count || 0;
+  if (teamsCount === 0) {
+    runSync(`
+      INSERT INTO teams (name, description, color) VALUES
+      ('Frontend', 'Web and Mobile client interface, UI components, responsiveness', 'blue'),
+      ('Backend', 'REST APIs, business logic, microservices, authentication', 'emerald'),
+      ('Database', 'Relational data modeling, schema migrations, indexing, optimization', 'amber'),
+      ('Testing / QA', 'Unit, integration, automated regression and load testing', 'purple'),
+      ('DevOps / Cloud', 'CI/CD pipelines, containerization, cloud infrastructure deployment', 'rose'),
+      ('UI/UX Design', 'User journey mapping, wireframing, design systems', 'cyan'),
+      ('ML / AI', 'Model training, fine-tuning, inference pipelines and agents', 'violet');
+    `);
+
+    // Add initial team member mapping
+    runSync(`
+      INSERT INTO team_members (team_id, user_name, role_title, email) VALUES
+      (1, 'Rahul Sharma', 'Frontend Lead', 'rahul@meetingiq.ai'),
+      (2, 'Arun Kumar', 'Backend Lead', 'arun@meetingiq.ai'),
+      (3, 'Priya Patel', 'Senior Database Engineer', 'priya@meetingiq.ai'),
+      (4, 'Dr. Sarah Jenkins', 'QA & Delivery Manager', 'admin@meetingiq.ai'),
+      (5, 'Arun Kumar', 'DevOps Specialist', 'arun@meetingiq.ai');
+    `);
+  }
+}
+
+// Synchronous wrapper queries
+function querySync(sql, params = []) {
+  if (!dbInstance) throw new Error('Database not initialized. Call getDb() first.');
+  try {
+    const stmt = dbInstance.prepare(sql);
+    if (params && params.length > 0) {
+      stmt.bind(params);
+    }
+    const rows = [];
+    while (stmt.step()) {
+      rows.push(stmt.getAsObject());
+    }
+    stmt.free();
+    return rows;
+  } catch (err) {
+    console.error('SQL querySync error on:', sql, params, err.message);
+    throw err;
+  }
+}
+
+function getSync(sql, params = []) {
+  const rows = querySync(sql, params);
+  return rows.length > 0 ? rows[0] : null;
+}
+
+function runSync(sql, params = []) {
+  if (!dbInstance) throw new Error('Database not initialized. Call getDb() first.');
+  try {
+    if (params && params.length > 0) {
+      const stmt = dbInstance.prepare(sql);
+      stmt.run(params);
+      stmt.free();
+    } else {
+      dbInstance.run(sql);
+    }
+
+    const lastIdRes = dbInstance.exec("SELECT last_insert_rowid() as id");
+    const lastId = (lastIdRes && lastIdRes[0] && lastIdRes[0].values[0]) ? lastIdRes[0].values[0][0] : null;
+    const modified = (dbInstance && typeof dbInstance.getRowsModified === 'function') ? dbInstance.getRowsModified() : 1;
+    
+    persist();
+    return { lastInsertRowid: lastId, lastID: lastId, changes: modified };
+  } catch (err) {
+    console.error('SQL runSync error on:', sql, params, err.message);
+    throw err;
+  }
+}
+
+// Reset database to empty (keeps users and teams for immediate login/custom meetings)
+function resetDatabase() {
+  if (!dbInstance) return;
+  dbInstance.run(`
+    DELETE FROM translations;
+    DELETE FROM meeting_relationships;
+    DELETE FROM unresolved_issues;
+    DELETE FROM action_items;
+    DELETE FROM task_history;
+    DELETE FROM tasks;
+    DELETE FROM decisions;
+    DELETE FROM summaries;
+    DELETE FROM transcripts;
+    DELETE FROM participants;
+    DELETE FROM meetings;
+    DELETE FROM ai_query_logs;
+  `);
+  persist();
+  return { success: true, message: 'Database reset to clean blank state.' };
+}
+
+// Seed the 3-meeting cross-meeting progression for viva demonstration
+function seedSampleScenario() {
+  resetDatabase();
+
+  // Meeting 1: Kickoff
+  runSync(`
+    INSERT INTO meetings (id, title, meeting_date, start_time, duration_minutes, agenda, location_or_link, status, audio_file_url, created_by_user_id, summary, executive_overview, follow_up_notes)
+    VALUES (
+      1,
+      'Project Kickoff & Architecture Review',
+      '2026-08-20',
+      '10:00:00',
+      45,
+      'Initial architectural breakdown, role assignment, authentication strategy, and database design.',
+      'Conference Room A / Google Meet',
+      'ANALYZED',
+      'https://actions.google.com/sounds/v1/ambiences/office_murmur.ogg',
+      1,
+      'The team conducted the kickoff session for the new system. Rahul was assigned to lead the Login and Authentication module. Priya took ownership of the relational database schema, and Arun is spearheading backend REST API development.',
+      'High-level architecture approved. Initial milestone set for end of August.',
+      'Prepare schema diagrams and API specs for the Sprint 1 sync.'
+    )
+  `);
+
+  // Participants Meeting 1
+  runSync(`
+    INSERT INTO participants (meeting_id, name, email, role_in_meeting, department) VALUES
+    (1, 'Dr. Sarah Jenkins', 'admin@meetingiq.ai', 'Host', 'Product Management'),
+    (1, 'Rahul Sharma', 'rahul@meetingiq.ai', 'Speaker', 'Frontend'),
+    (1, 'Priya Patel', 'priya@meetingiq.ai', 'Speaker', 'Database'),
+    (1, 'Arun Kumar', 'arun@meetingiq.ai', 'Speaker', 'Backend');
+  `);
+
+  // Transcript Meeting 1
+  const t1Diarized = JSON.stringify([
+    { speaker: "Dr. Sarah Jenkins", time: "00:05", text: "Welcome everyone. Today we are launching the Project Development kickoff. Let us distribute key responsibilities." },
+    { speaker: "Rahul Sharma", time: "02:15", text: "I will take up the complete Login and Authentication module. Frontend team will finish by August 25." },
+    { speaker: "Priya Patel", time: "05:40", text: "Database team will finalize the relational schema and normalization by August 22." },
+    { speaker: "Arun Kumar", time: "08:10", text: "Backend team will create core REST API skeleton and controllers by August 30." },
+    { speaker: "Dr. Sarah Jenkins", time: "12:00", text: "Great. We decided to use JWT authentication and standardized relational modeling." }
+  ]);
+  runSync(`
+    INSERT INTO transcripts (meeting_id, raw_text, diarized_json, confidence_score, language, audio_duration_seconds)
+    VALUES (
+      1,
+      'Sarah: Welcome everyone. Today we are launching the Project Development kickoff. Let us distribute key responsibilities.\nRahul: I will take up the complete Login and Authentication module. Frontend team will finish by August 25.\nPriya: Database team will finalize the relational schema and normalization by August 22.\nArun: Backend team will create core REST API skeleton and controllers by August 30.\nSarah: Great. We decided to use JWT authentication and standardized relational modeling.',
+      ?,
+      0.98,
+      'en-US',
+      2700
+    )
+  `, [t1Diarized]);
+
+  // Tasks spawned in Meeting 1
+  runSync(`
+    INSERT INTO tasks (id, task_code, title, description, assigned_person, assigned_team, priority, status, created_date, original_deadline, current_deadline, source_meeting_id, last_discussed_meeting_id, progress_percentage)
+    VALUES 
+    (1, 'TSK-101', 'Complete Login & Authentication Module', 'Design frontend login/signup screens, integrate JWT token auth, and handle error validations.', 'Rahul Sharma', 'Frontend', 'HIGH', 'PENDING', '2026-08-20', '2026-08-25', '2026-08-25', 1, 1, 0),
+    (2, 'TSK-102', 'Create Database Relational Schema', 'Design 3NF normalized tables for meetings, tasks, transcripts, and decisions with indexes.', 'Priya Patel', 'Database', 'HIGH', 'PENDING', '2026-08-20', '2026-08-22', '2026-08-22', 1, 1, 0),
+    (3, 'TSK-103', 'Develop Core REST APIs & Controllers', 'Build Spring/Express controllers, DTOs, services, and error handling for all entities.', 'Arun Kumar', 'Backend', 'CRITICAL', 'PENDING', '2026-08-20', '2026-08-30', '2026-08-30', 1, 1, 0);
+  `);
+
+  runSync(`
+    INSERT INTO task_history (task_id, meeting_id, action_type, previous_status, new_status, previous_deadline, new_deadline, previous_assignee, new_assignee, progress_note, discussed_date)
+    VALUES
+    (1, 1, 'CREATED', NULL, 'PENDING', NULL, '2026-08-25', NULL, 'Rahul Sharma', 'Task created during Project Kickoff meeting. Assigned automatically to Frontend team.', '2026-08-20'),
+    (2, 1, 'CREATED', NULL, 'PENDING', NULL, '2026-08-22', NULL, 'Priya Patel', 'Task created for database schema design and relational constraints.', '2026-08-20'),
+    (3, 1, 'CREATED', NULL, 'PENDING', NULL, '2026-08-30', NULL, 'Arun Kumar', 'Core REST API development initiated.', '2026-08-20');
+  `);
+
+  // Decisions Meeting 1
+  runSync(`
+    INSERT INTO decisions (id, meeting_id, decision_text, topic, people_involved, rationale, impact_level, status, decided_date)
+    VALUES
+    (1, 1, 'Adopt JWT (JSON Web Tokens) with stateless authentication architecture.', 'Authentication & Security', 'Dr. Sarah Jenkins, Rahul Sharma, Arun Kumar', 'Ensures horizontal scalability and clean single-page app decoupling.', 'HIGH', 'ACTIVE', '2026-08-20'),
+    (2, 1, 'Standardize on relational database schema with strict foreign keys and UTF-8 support.', 'Database Architecture', 'Priya Patel, Arun Kumar', 'Guarantees transactional consistency across meeting entities.', 'MEDIUM', 'ACTIVE', '2026-08-20');
+  `);
+
+  // Meeting 2: Sprint Review & Blocker Sync
+  runSync(`
+    INSERT INTO meetings (id, title, meeting_date, start_time, duration_minutes, agenda, location_or_link, status, audio_file_url, created_by_user_id, summary, executive_overview, follow_up_notes)
+    VALUES (
+      2,
+      'Sprint 1 Progress & Blocker Sync',
+      '2026-08-28',
+      '11:00:00',
+      40,
+      'Review of login module progress, database schema verification, API progress, and blocker resolution.',
+      'Virtual Meeting Room 3',
+      'ANALYZED',
+      'https://actions.google.com/sounds/v1/ambiences/office_murmur.ogg',
+      1,
+      'Priya confirmed database schema is 100% complete. Rahul reported login backend is finished, but UI responsiveness requires more time; deadline extended from Aug 25 to Sep 02. Arun reported 60% completion on REST APIs. Resolved token refresh mechanism using HTTP-Only cookies.',
+      'Sprint 1 is on track with a minor 7-day extension for frontend auth integration.',
+      'Deliver completed login UI and verify RBAC permissions in Meeting 3.'
+    )
+  `);
+
+  runSync(`
+    INSERT INTO participants (meeting_id, name, email, role_in_meeting, department) VALUES
+    (2, 'Dr. Sarah Jenkins', 'admin@meetingiq.ai', 'Host', 'Product Management'),
+    (2, 'Rahul Sharma', 'rahul@meetingiq.ai', 'Speaker', 'Frontend'),
+    (2, 'Priya Patel', 'priya@meetingiq.ai', 'Speaker', 'Database'),
+    (2, 'Arun Kumar', 'arun@meetingiq.ai', 'Speaker', 'Backend');
+  `);
+
+  const t2Diarized = JSON.stringify([
+    { speaker: "Dr. Sarah Jenkins", time: "00:10", text: "Good morning team. Let us review where we stand on previous commitments from Kickoff." },
+    { speaker: "Dr. Sarah Jenkins", time: "01:20", text: "Rahul, how is the login module coming along?" },
+    { speaker: "Rahul Sharma", time: "02:05", text: "Backend APIs for login are finished, but frontend form validation and styling are still pending. Frontend team will finish by September 2." },
+    { speaker: "Dr. Sarah Jenkins", time: "04:30", text: "Okay, deadline extended to September 2. Priya, what is the status of the database?" },
+    { speaker: "Priya Patel", time: "06:10", text: "Database schema and indexes are 100% complete and tested." },
+    { speaker: "Arun Kumar", time: "09:15", text: "REST APIs are 60% done. I am currently integrating participant and task endpoints." },
+    { speaker: "Dr. Sarah Jenkins", time: "14:00", text: "Excellent. For token refresh, we decided to use secure HTTP-Only cookies." }
+  ]);
+  runSync(`
+    INSERT INTO transcripts (meeting_id, raw_text, diarized_json, confidence_score, language, audio_duration_seconds)
+    VALUES (
+      2,
+      'Sarah: Good morning team. Let us review where we stand on previous commitments from Kickoff.\nSarah: Rahul, how is the login module coming along?\nRahul: Backend APIs for login are finished, but frontend form validation and styling are still pending. Frontend team will finish by September 2.\nSarah: Okay, deadline extended to September 2. Priya, what is the status of the database?\nPriya: Database schema and indexes are 100% complete and tested.\nArun: REST APIs are 60% done. I am currently integrating participant and task endpoints.\nSarah: Excellent. For token refresh, we decided to use secure HTTP-Only cookies.',
+      ?,
+      0.97,
+      'en-US',
+      2400
+    )
+  `, [t2Diarized]);
+
+  // Update tasks based on Meeting 2
+  runSync(`
+    UPDATE tasks SET status = 'IN_PROGRESS', current_deadline = '2026-09-02', last_discussed_meeting_id = 2, progress_percentage = 60, updated_at = CURRENT_TIMESTAMP WHERE id = 1;
+    UPDATE tasks SET status = 'COMPLETED', completion_date = '2026-08-28', last_discussed_meeting_id = 2, progress_percentage = 100, updated_at = CURRENT_TIMESTAMP WHERE id = 2;
+    UPDATE tasks SET status = 'IN_PROGRESS', last_discussed_meeting_id = 2, progress_percentage = 60, updated_at = CURRENT_TIMESTAMP WHERE id = 3;
+    INSERT INTO tasks (id, task_code, title, description, assigned_person, assigned_team, priority, status, created_date, original_deadline, current_deadline, source_meeting_id, last_discussed_meeting_id, progress_percentage)
+    VALUES (4, 'TSK-104', 'Implement Role-Based Access Control (RBAC)', 'Enforce granular permissions between Admin, Host, and Attendee roles in API routes.', 'Priya Patel', 'Database', 'MEDIUM', 'PENDING', '2026-08-28', '2026-09-05', '2026-09-05', 2, 2, 0);
+  `);
+
+  runSync(`
+    INSERT INTO task_history (task_id, meeting_id, action_type, previous_status, new_status, previous_deadline, new_deadline, previous_assignee, new_assignee, progress_note, discussed_date)
+    VALUES
+    (1, 2, 'PROGRESS_UPDATED', 'PENDING', 'IN_PROGRESS', '2026-08-25', '2026-08-25', 'Rahul Sharma', 'Rahul Sharma', 'Rahul reported backend auth endpoints completed; frontend validation remains in progress.', '2026-08-28'),
+    (1, 2, 'DEADLINE_EXTENDED', 'IN_PROGRESS', 'IN_PROGRESS', '2026-08-25', '2026-09-02', 'Rahul Sharma', 'Rahul Sharma', 'Deadline officially extended to September 2 to accommodate responsive styling and validation.', '2026-08-28'),
+    (2, 2, 'COMPLETED', 'PENDING', 'COMPLETED', '2026-08-22', '2026-08-22', 'Priya Patel', 'Priya Patel', 'Database schema finalized with tables, foreign keys, and indexes.', '2026-08-28'),
+    (3, 2, 'PROGRESS_UPDATED', 'PENDING', 'IN_PROGRESS', '2026-08-30', '2026-08-30', 'Arun Kumar', 'Arun Kumar', 'Reached 60% completion. Meeting and Task endpoints ready.', '2026-08-28'),
+    (4, 2, 'CREATED', NULL, 'PENDING', NULL, '2026-09-05', NULL, 'Priya Patel', 'RBAC task spawned following security review.', '2026-08-28');
+  `);
+
+  // Decisions Meeting 2
+  runSync(`
+    INSERT INTO decisions (id, meeting_id, decision_text, topic, people_involved, rationale, impact_level, status, decided_date)
+    VALUES (3, 2, 'Store JWT Refresh Tokens in secure HTTP-Only Cookies to prevent XSS attacks.', 'Security & Storage', 'Dr. Sarah Jenkins, Rahul Sharma', 'Mitigates token theft risks identified during security sync.', 'HIGH', 'ACTIVE', '2026-08-28');
+  `);
+
+  // Meeting Relationships: Meeting 2 linked to Meeting 1
+  runSync(`
+    INSERT INTO meeting_relationships (current_meeting_id, previous_meeting_id, continuity_summary, carried_forward_tasks_count, resolved_issues_count, context_similarity_score)
+    VALUES (2, 1, 'Follow-up on Kickoff commitments: Verified database completion, acknowledged login module frontend delay with revised deadline (Aug 25 -> Sep 02), and resolved token security strategy.', 3, 1, 0.94);
+  `);
+
+  // Meeting 3: Pre-Release Finalization
+  runSync(`
+    INSERT INTO meetings (id, title, meeting_date, start_time, duration_minutes, agenda, location_or_link, status, audio_file_url, created_by_user_id, summary, executive_overview, follow_up_notes)
+    VALUES (
+      3,
+      'Pre-Release Sprint Review & Milestone Finalization',
+      '2026-09-05',
+      '14:30:00',
+      50,
+      'Verification of completed login module, final API integration testing, and deployment preparation.',
+      'Main Boardroom / Hybrid',
+      'ANALYZED',
+      'https://actions.google.com/sounds/v1/ambiences/office_murmur.ogg',
+      1,
+      'Rahul demoed the completed Login Module with full input validation. Priya confirmed Role-Based Access Control is enforced. Arun successfully integrated all backend endpoints with Swagger documentation. Decided on the AWS deployment schedule for Sep 10.',
+      'All core sprint deliverables verified and approved for cloud deployment.',
+      'Execute cloud deployment on September 10 and run final user acceptance tests.'
+    )
+  `);
+
+  runSync(`
+    INSERT INTO participants (meeting_id, name, email, role_in_meeting, department) VALUES
+    (3, 'Dr. Sarah Jenkins', 'admin@meetingiq.ai', 'Host', 'Product Management'),
+    (3, 'Rahul Sharma', 'rahul@meetingiq.ai', 'Speaker', 'Frontend'),
+    (3, 'Priya Patel', 'priya@meetingiq.ai', 'Speaker', 'Database'),
+    (3, 'Arun Kumar', 'arun@meetingiq.ai', 'Speaker', 'Backend');
+  `);
+
+  const t3Diarized = JSON.stringify([
+    { speaker: "Dr. Sarah Jenkins", time: "00:08", text: "Hello everyone, welcome to the final pre-release sprint review." },
+    { speaker: "Dr. Sarah Jenkins", time: "01:15", text: "Rahul, please update us on the login module." },
+    { speaker: "Rahul Sharma", time: "02:10", text: "The login and authentication module is completely finished! All frontend screens, validation, and token handling are verified." },
+    { speaker: "Priya Patel", time: "04:50", text: "Role-Based Access Control and permissions verification is also complete." },
+    { speaker: "Arun Kumar", time: "07:30", text: "All REST API endpoints are fully developed and documented in Swagger." },
+    { speaker: "Dr. Sarah Jenkins", time: "11:20", text: "Fantastic work team. Arun, DevOps team please prepare the cloud deployment pipeline by September 10." }
+  ]);
+  runSync(`
+    INSERT INTO transcripts (meeting_id, raw_text, diarized_json, confidence_score, language, audio_duration_seconds)
+    VALUES (
+      3,
+      'Sarah: Hello everyone, welcome to the final pre-release sprint review.\nSarah: Rahul, please update us on the login module.\nRahul: The login and authentication module is completely finished! All frontend screens, validation, and token handling are verified.\nPriya: Role-Based Access Control and permissions verification is also complete.\nArun: All REST API endpoints are fully developed and documented in Swagger.\nSarah: Fantastic work team. Arun, DevOps team please prepare the cloud deployment pipeline by September 10.',
+      ?,
+      0.99,
+      'en-US',
+      3000
+    )
+  `, [t3Diarized]);
+
+  // Update tasks based on Meeting 3
+  runSync(`
+    UPDATE tasks SET status = 'COMPLETED', completion_date = '2026-09-05', last_discussed_meeting_id = 3, progress_percentage = 100, updated_at = CURRENT_TIMESTAMP WHERE id = 1;
+    UPDATE tasks SET status = 'COMPLETED', completion_date = '2026-09-05', last_discussed_meeting_id = 3, progress_percentage = 100, updated_at = CURRENT_TIMESTAMP WHERE id = 3;
+    UPDATE tasks SET status = 'COMPLETED', completion_date = '2026-09-05', last_discussed_meeting_id = 3, progress_percentage = 100, updated_at = CURRENT_TIMESTAMP WHERE id = 4;
+    INSERT INTO tasks (id, task_code, title, description, assigned_person, assigned_team, priority, status, created_date, original_deadline, current_deadline, source_meeting_id, last_discussed_meeting_id, progress_percentage)
+    VALUES (5, 'TSK-105', 'Cloud Deployment & CI/CD Pipeline', 'Deploy backend container and frontend build to AWS/Cloud infrastructure.', 'Arun Kumar', 'DevOps / Cloud', 'HIGH', 'IN_PROGRESS', '2026-09-05', '2026-09-10', '2026-09-10', 3, 3, 40);
+  `);
+
+  runSync(`
+    INSERT INTO task_history (task_id, meeting_id, action_type, previous_status, new_status, previous_deadline, new_deadline, previous_assignee, new_assignee, progress_note, discussed_date)
+    VALUES
+    (1, 3, 'COMPLETED', 'IN_PROGRESS', 'COMPLETED', '2026-09-02', '2026-09-02', 'Rahul Sharma', 'Rahul Sharma', 'Login module fully completed, verified, and merged into main.', '2026-09-05'),
+    (3, 3, 'COMPLETED', 'IN_PROGRESS', 'COMPLETED', '2026-08-30', '2026-09-05', 'Arun Kumar', 'Arun Kumar', 'All REST API endpoints completed and documented in Swagger.', '2026-09-05'),
+    (4, 3, 'COMPLETED', 'PENDING', 'COMPLETED', '2026-09-05', '2026-09-05', 'Priya Patel', 'Priya Patel', 'RBAC rules verified across all controller endpoints.', '2026-09-05'),
+    (5, 3, 'CREATED', NULL, 'IN_PROGRESS', NULL, '2026-09-10', NULL, 'Arun Kumar', 'Cloud CI/CD deployment configured for AWS container environment.', '2026-09-05');
+  `);
+
+  // Decisions Meeting 3
+  runSync(`
+    INSERT INTO decisions (id, meeting_id, decision_text, topic, people_involved, rationale, impact_level, status, decided_date)
+    VALUES (4, 3, 'Schedule official production release deployment for September 12, 2026.', 'Release Management', 'All Team Members', 'All primary sprint milestones completed and validated.', 'HIGH', 'ACTIVE', '2026-09-05');
+  `);
+
+  // Meeting Relationships: Meeting 3 linked to Meeting 2
+  runSync(`
+    INSERT INTO meeting_relationships (current_meeting_id, previous_meeting_id, continuity_summary, carried_forward_tasks_count, resolved_issues_count, context_similarity_score)
+    VALUES (3, 2, 'Final milestone verification: Confirmed completion of Login Module (TSK-101), REST APIs (TSK-103), and RBAC (TSK-104). Transitioned team focus to AWS cloud deployment.', 4, 1, 0.96);
+  `);
+
+  persist();
+  return { success: true, message: 'Realistic 3-meeting cross-meeting progression scenario seeded successfully!' };
+}
+
+module.exports = {
+  getDb,
+  all: (sql, params) => querySync(sql, params),
+  query: (sql, params) => querySync(sql, params),
+  get: (sql, params) => getSync(sql, params),
+  run: (sql, params) => runSync(sql, params),
+  resetDatabase,
+  seedSampleScenario,
+  persist
+};
